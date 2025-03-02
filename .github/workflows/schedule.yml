@@ -27,6 +27,7 @@ jobs:
         run: |
           echo "🔍 Debugging Environment Variables..."
           echo "DB_URL is set: ${{ secrets.DB_URL != '' }}"
+          echo "DB_URL value: $DB_URL"
           echo "SERP_API_KEY is set: ${{ secrets.SERP_API_KEY != '' }}"
 
       - name: Get all campaign IDs from database
