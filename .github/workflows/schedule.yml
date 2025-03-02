@@ -1,0 +1,73 @@
+name: Run Streamlit Job Daily
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Runs every day at 6 AM UTC
+  workflow_dispatch:  # Allows manual trigger
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          echo "📦 Installing dependencies..."
+          pip install -r requirements.txt
+          pip install psycopg2-binary  # Ensure psycopg2-binary is installed for database queries
+
+      - name: Debug Environment Variables
+        run: |
+          echo "🔍 Debugging Environment Variables..."
+          echo "DB_URL is set: ${{ secrets.DB_URL != '' }}"
+          echo "SERP_API_KEY is set: ${{ secrets.SERP_API_KEY != '' }}"
+
+      - name: Get all campaign IDs from database
+        id: get_campaigns
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+        run: |
+          python -c """
+          import psycopg2
+          import os
+          conn = psycopg2.connect(os.getenv('DB_URL'), sslmode='require')
+          cursor = conn.cursor()
+          cursor.execute('SELECT campaign_id FROM campaigns')
+          campaigns = [row[0] for row in cursor.fetchall()]
+          cursor.close()
+          conn.close()
+          print(f'::set-output name=campaigns::{",".join(campaigns)}')
+          """
+
+      - name: Run the script for each campaign
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+          SERP_API_KEY: ${{ secrets.SERP_API_KEY }}
+        run: |
+          echo "🚀 Running app.py for all campaigns..."
+          for campaign in ${{ steps.get_campaigns.outputs.campaigns }}; do
+            echo "Processing campaign: $campaign"
+            python -c "import os; print(f'DB_URL length: {len(os.getenv(\"DB_URL\") or \"\")}'); print(f'SERP_API_KEY length: {len(os.getenv(\"SERP_API_KEY\") or \"\")}')"
+            python app.py github "$campaign"
+            echo "✅ Script execution completed for campaign $campaign"
+          done
+
+      - name: Check for data in database for each campaign
+        env:
+          DB_URL: ${{ secrets.DB_URL }}
+        run: |
+          echo "🔍 Checking if data was stored for all campaigns..."
+          for campaign in ${{ steps.get_campaigns.outputs.campaigns }}; do
+            echo "Checking campaign: $campaign"
+            python check_db.py "$campaign"
+          done
+
+      - name: Capture Logs
+        run: cat logs.txt || echo "⚠️ No logs captured."
