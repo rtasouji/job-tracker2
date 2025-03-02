@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger("job-tracker")
 
 # Database connection function
-DB_URL = os.getenv("NEW_DB_URL")
+DB_URL = os.getenv("DB_URL")
 if not DB_URL:
     raise ValueError("❌ ERROR: DB_URL environment variable is not set!")
 
