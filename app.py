@@ -279,10 +279,17 @@ if page == "Visibility Tracker":
     # Display Logo
     st.image("logo.png", width=200)
 
-    # Date Range Selector
+    # Date Range Selector with dynamic default last 30 days
     st.sidebar.header("Date Range Selector")
-    start_date = st.sidebar.date_input("Start Date", datetime.date(2025, 2, 1))
-    end_date = st.sidebar.date_input("End Date", datetime.date(2025, 2, 28))
+    today = datetime.date.today()  # Use current date dynamically
+    default_start_date = today - datetime.timedelta(days=30)  # 30 days before today
+    start_date = st.sidebar.date_input("Start Date", value=default_start_date)
+    end_date = st.sidebar.date_input("End Date", value=today)
+
+    # Ensure end_date is not before start_date
+    if start_date > end_date:
+        st.sidebar.error("End date must be after start date!")
+        st.stop()
 
     # Campaign selector for visibility tracker
     conn = get_db_connection()
