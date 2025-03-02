@@ -86,12 +86,13 @@ def load_jobs(campaign_id):
     df = pd.read_csv(csv_path)
     return df.to_dict(orient="records")
 
-# Fetch Google Jobs Results from SerpAPI (unchanged)
+# Fetch Google Jobs Results from SerpAPI
 def get_google_jobs_results(query, location):
     SERP_API_KEY = os.getenv("SERP_API_KEY")
     if not SERP_API_KEY:
         raise ValueError("❌ ERROR: SERP_API_KEY environment variable is not set!")
 
+    logger.info(f"Fetching results for query: {query} in location: {location} with API key: {SERP_API_KEY[:4]}...{SERP_API_KEY[-4:]}")
     url = "https://serpapi.com/search"
     params = {
         "engine": "google_jobs",
@@ -102,18 +103,25 @@ def get_google_jobs_results(query, location):
     }
     
     response = requests.get(url, params=params)
+    logger.info(f"SerpAPI response status code: {response.status_code}")
     if response.status_code != 200:
+        logger.error(f"Failed to fetch data from SerpAPI. Status Code: {response.status_code}, Response: {response.text}")
         raise RuntimeError(f"❌ ERROR: Failed to fetch data from SerpAPI. Status Code: {response.status_code}")
-    return response.json().get("jobs_results", [])
+    
+    results = response.json().get("jobs_results", [])
+    logger.info(f"Received {len(results)} job results for query: {query} in {location}")
+    return results
 
 # Compute Share of Voice & Additional Metrics for a specific campaign
 def compute_sov(campaign_id):
+    logger.info(f"Starting compute_sov for campaign {campaign_id}")
     domain_sov = defaultdict(float)
     domain_appearances = defaultdict(int)
     domain_v_rank = defaultdict(list)
     domain_h_rank = defaultdict(list)
 
     jobs_data = load_jobs(campaign_id)
+    logger.info(f"Loaded {len(jobs_data)} job queries from CSV for campaign {campaign_id}")
     total_sov = 0  
 
     for job_query in jobs_data:
@@ -124,38 +132,42 @@ def compute_sov(campaign_id):
         try:
             jobs = get_google_jobs_results(job_title, location)
             logger.info(f"Retrieved {len(jobs)} job results for query in campaign {campaign_id}")
-            
             if not jobs:
                 logger.warning(f"No jobs found for query: {job_title} in {location} for campaign {campaign_id}")
             
             for job_rank, job in enumerate(jobs, start=1):
                 apply_options = job.get("apply_options", [])
                 V = 1 / job_rank  
+                logger.debug(f"Processing job at rank {job_rank} with apply_options: {apply_options}")
 
                 for link_order, option in enumerate(apply_options, start=1):
                     if "link" in option:
                         domain = extract_domain(option["link"])
                         H = 1 / link_order  
                         weight = V * H  
+                        logger.debug(f"Processing domain {domain} with weight {weight}")
                         domain_sov[domain] += weight  
                         domain_appearances[domain] += 1
                         domain_v_rank[domain].append(job_rank)
                         domain_h_rank[domain].append(link_order)
                         total_sov += weight  
-
         except Exception as e:
             logger.error(f"Error processing job query {job_title} for campaign {campaign_id}: {str(e)}")
             continue
 
     if total_sov > 0:
+        logger.info(f"Computed SoV for {len(domain_sov)} domains with total SoV: {total_sov} for campaign {campaign_id}")
         domain_sov = {domain: round((sov / total_sov) * 100, 4) for domain, sov in domain_sov.items()}
+    else:
+        logger.warning(f"No SoV computed for campaign {campaign_id} due to zero total SoV")
     
     domain_avg_v_rank = {domain: round(sum(vr) / len(vr), 2) for domain, vr in domain_v_rank.items() if vr}
     domain_avg_h_rank = {domain: round(sum(hr) / len(hr), 2) for domain, hr in domain_h_rank.items() if hr}
 
+    logger.info(f"Returning SoV data for {len(domain_sov)} domains for campaign {campaign_id}")
     return domain_sov, domain_appearances, domain_avg_v_rank, domain_avg_h_rank
 
-# Extract Domain from URL (unchanged)
+# Extract Domain from URL
 def extract_domain(url):
     extracted = tldextract.extract(url)
     domain = f"{extracted.domain}.{extracted.suffix}" if extracted.suffix else extracted.domain
@@ -192,6 +204,7 @@ def save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, campaign_id):
 
 # Retrieve historical data for a specific campaign
 def get_historical_data(start_date, end_date, campaign_id):
+    logger.info(f"Retrieving historical data for campaign {campaign_id} from {start_date} to {end_date}")
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -205,6 +218,7 @@ def get_historical_data(start_date, end_date, campaign_id):
     table_exists = cursor.fetchone()[0]
     
     if not table_exists:
+        logger.warning("Share_of_voice table does not exist.")
         st.warning("⚠️ No data available yet.")
         cursor.close()
         conn.close()
@@ -215,13 +229,19 @@ def get_historical_data(start_date, end_date, campaign_id):
         FROM share_of_voice 
         WHERE date BETWEEN %s AND %s AND campaign_id = %s
     """
+    logger.info(f"Executing query for campaign {campaign_id} with date range {start_date} to {end_date}")
     cursor.execute(query, (start_date, end_date, campaign_id))
     rows = cursor.fetchall()
+    logger.info(f"Found {len(rows)} rows for campaign {campaign_id}")
 
     df = pd.DataFrame(rows, columns=["domain", "date", "sov", "appearances", "avg_v_rank", "avg_h_rank"])
 
     cursor.close()
     conn.close()
+
+    if df.empty:
+        logger.warning(f"No data available for campaign {campaign_id} in the selected date range.")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     df["date"] = pd.to_datetime(df["date"]).dt.date  
     df_agg = df.groupby(["domain", "date"], as_index=False).agg({
@@ -241,14 +261,121 @@ def get_historical_data(start_date, end_date, campaign_id):
 
     df_appearances = df_agg.pivot(index="domain", columns="date", values="appearances").fillna(0)
 
+    logger.info(f"Returning data for {len(df_sov)} domains for campaign {campaign_id}")
     return df_sov, df_metrics, df_appearances
+
+# New function to get total data across all campaigns
+def get_total_historical_data(start_date, end_date):
+    logger.info(f"Retrieving total historical data from {start_date} to {end_date}")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_name = 'share_of_voice'
+        );
+    """)
+    
+    table_exists = cursor.fetchone()[0]
+    
+    if not table_exists:
+        logger.warning("Share_of_voice table does not exist.")
+        st.warning("⚠️ No data available yet.")
+        cursor.close()
+        conn.close()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    query = """
+        SELECT domain, date, sov, appearances, avg_v_rank, avg_h_rank
+        FROM share_of_voice 
+        WHERE date BETWEEN %s AND %s
+    """
+    logger.info(f"Executing total query with date range {start_date} to {end_date}")
+    cursor.execute(query, (start_date, end_date))
+    rows = cursor.fetchall()
+    logger.info(f"Found {len(rows)} total rows across all campaigns")
+
+    df = pd.DataFrame(rows, columns=["domain", "date", "sov", "appearances", "avg_v_rank", "avg_h_rank"])
+
+    cursor.close()
+    conn.close()
+
+    if df.empty:
+        logger.warning("No total data available for the selected date range.")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df["date"] = pd.to_datetime(df["date"]).dt.date  
+    df_agg = df.groupby(["domain", "date"], as_index=False).agg({
+        "sov": "sum",  # Sum SoV across campaigns for the same domain and date
+        "appearances": "sum",  # Sum appearances across campaigns
+        "avg_v_rank": "mean",  # Average vertical rank across campaigns
+        "avg_h_rank": "mean"   # Average horizontal rank across campaigns
+    })
+
+    df_sov = df_agg.pivot(index="domain", columns="date", values="sov").fillna(0)
+    df_metrics = df_agg.pivot(index="domain", columns="date", values=["appearances", "avg_v_rank", "avg_h_rank"]).fillna(0)
+    df_metrics = df_metrics.swaplevel(axis=1).sort_index(axis=1)
+
+    if not df_sov.empty:
+        most_recent_date = df_sov.columns[-1]  
+        df_sov = df_sov.sort_values(by=most_recent_date, ascending=False)
+
+    df_appearances = df_agg.pivot(index="domain", columns="date", values="appearances").fillna(0)
+
+    logger.info(f"Returning total data for {len(df_sov)} domains")
+    return df_sov, df_metrics, df_appearances
+
+# New function to fetch and store total data
+def compute_and_store_total_data():
+    logger.info("Computing and storing total data across all campaigns")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT domain, date, sov, appearances, avg_v_rank, avg_h_rank, campaign_id
+        FROM share_of_voice
+    """)
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    if not rows:
+        logger.warning("No data available to compute total across campaigns")
+        return
+
+    # Aggregate all data across campaigns
+    domain_sov = defaultdict(float)
+    domain_appearances = defaultdict(int)
+    domain_v_rank = defaultdict(list)
+    domain_h_rank = defaultdict(list)
+
+    for row in rows:
+        domain, date, sov, appearances, avg_v_rank, avg_h_rank, _ = row
+        domain_sov[domain] += sov
+        domain_appearances[domain] += appearances
+        domain_v_rank[domain].append(avg_v_rank)
+        domain_h_rank[domain].append(avg_h_rank)
+
+    # Calculate averages for ranks
+    total_avg_v_rank = {domain: round(sum(ranks) / len(ranks), 2) for domain, ranks in domain_v_rank.items() if ranks}
+    total_avg_h_rank = {domain: round(sum(ranks) / len(ranks), 2) for domain, ranks in domain_h_rank.items() if ranks}
+
+    # Normalize SoV to 100% total (optional, depending on your needs)
+    total_sov = sum(domain_sov.values())
+    if total_sov > 0:
+        domain_sov = {domain: round((sov / total_sov) * 100, 4) for domain, sov in domain_sov.items()}
+
+    # Store total data with a special campaign_id (e.g., 'total')
+    save_to_db(domain_sov, domain_appearances, total_avg_v_rank, total_avg_h_rank, "total")
 
 # Create or update a campaign
 def create_or_update_campaign(campaign_id, campaign_name, csv_file):
     if csv_file is not None:
         csv_path = f"campaigns/{campaign_id}_jobs.csv"
+        logger.info(f"Attempting to create directory 'campaigns' at {os.getcwd()}")
         os.makedirs("campaigns", exist_ok=True)
-        # Save the uploaded file to disk
+        logger.info(f"Saving CSV file to {csv_path}")
         with open(csv_path, "wb") as f:
             f.write(csv_file.getbuffer())
     else:
@@ -266,7 +393,7 @@ def create_or_update_campaign(campaign_id, campaign_name, csv_file):
     conn.commit()
     cursor.close()
     conn.close()
-    logger.info(f"Campaign '{campaign_id}' created/updated successfully with CSV at {csv_path}")
+    logger.info(f"Campaign '{campaign_id}' created/updated successfully as '{campaign_name}' with CSV at {csv_path}")
     return True
 
 # Streamlit UI
@@ -291,7 +418,7 @@ if page == "Visibility Tracker":
         st.sidebar.error("End date must be after start date!")
         st.stop()
 
-    # Campaign selector for visibility tracker
+    # Campaign selector for visibility tracker (using campaign names)
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT campaign_id, name FROM campaigns")
@@ -299,18 +426,33 @@ if page == "Visibility Tracker":
     cursor.close()
     conn.close()
 
-    campaign_options = ["default"] + [c[0] for c in campaigns]
-    selected_campaign = st.sidebar.selectbox("Select Campaign", campaign_options, index=0)
+    # Create a list of campaign names, including "Total" for all campaigns
+    campaign_name_options = ["Total"]  # Total campaign label
+    campaign_id_map = {"Total": "total"}  # Map name to ID for total
+    for campaign_id, name in campaigns:
+        campaign_name_options.append(name)
+        campaign_id_map[name] = campaign_id
 
-    # Fetch & Store Data for the selected campaign
+    # Dropdown with campaign names
+    selected_campaign_name = st.sidebar.selectbox("Select Campaign", campaign_name_options, index=0)
+    selected_campaign_id = campaign_id_map[selected_campaign_name]
+
+    # Fetch & Store Data for the selected campaign or compute total
     if st.button("Fetch & Store Data"):
-        sov_data, appearances, avg_v_rank, avg_h_rank = compute_sov(selected_campaign)
-        save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, selected_campaign)
-        st.success(f"Data stored successfully for campaign '{selected_campaign}'!")
+        if selected_campaign_id == "total":
+            compute_and_store_total_data()
+            st.success("Total data across all campaigns stored successfully!")
+        else:
+            sov_data, appearances, avg_v_rank, avg_h_rank = compute_sov(selected_campaign_id)
+            save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, selected_campaign_id)
+            st.success(f"Data stored successfully for campaign '{selected_campaign_name}'!")
 
-    # Show Historical Trends for the selected campaign
+    # Show Historical Trends for the selected campaign or total
     st.write("### Visibility Over Time")
-    df_sov, df_metrics, df_appearances = get_historical_data(start_date, end_date, selected_campaign)
+    if selected_campaign_id == "total":
+        df_sov, df_metrics, df_appearances = get_total_historical_data(start_date, end_date)
+    else:
+        df_sov, df_metrics, df_appearances = get_historical_data(start_date, end_date, selected_campaign_id)
 
     if not df_sov.empty:
         # Share of Voice Chart
@@ -324,7 +466,7 @@ if page == "Visibility Tracker":
                 name=domain
             ))
         fig1.update_layout(
-            title=f"Domains Visibility Over Time for Campaign '{selected_campaign}'",
+            title=f"Domains Visibility Over Time for {selected_campaign_name}",
             xaxis_title="Date",
             yaxis_title="Share of Voice (%)",
             updatemenus=[{"buttons": [{"args": [{"visible": True}], "label": "Show All", "method": "update"},
@@ -347,7 +489,7 @@ if page == "Visibility Tracker":
                 name=domain
             ))
         fig2.update_layout(
-            title=f"Domain Appearances Over Time for Campaign '{selected_campaign}'",
+            title=f"Domain Appearances Over Time for {selected_campaign_name}",
             xaxis_title="Date",
             yaxis_title="Number of Appearances",
             updatemenus=[{"buttons": [{"args": [{"visible": True}], "label": "Show All", "method": "update"},
@@ -358,7 +500,7 @@ if page == "Visibility Tracker":
         st.write("### Additional Metrics Over Time")
         st.dataframe(df_metrics.style.format("{:.2f}"))
     else:
-        st.write(f"No historical data available for the selected date range and campaign '{selected_campaign}'.")
+        st.write(f"No historical data available for the selected date range and {selected_campaign_name}")
 
 elif page == "Campaign Management":
     st.header("Campaign Management")
@@ -372,7 +514,7 @@ elif page == "Campaign Management":
     if st.button("Create/Update Campaign"):
         if campaign_id and campaign_name and csv_file:
             if create_or_update_campaign(campaign_id, campaign_name, csv_file):
-                st.success(f"Campaign '{campaign_id}' created/updated successfully!")
+                st.success(f"Campaign '{campaign_id}' created/updated successfully as '{campaign_name}'!")
             else:
                 st.error("Failed to create/update campaign. Please check the inputs.")
         else:
@@ -389,14 +531,19 @@ elif page == "Campaign Management":
 
     if campaigns:
         st.write("### Campaign List")
-        for campaign in campaigns:
-            st.write(f"- **Campaign ID:** {campaign[0]}, **Name:** {campaign[1]}, **Created At:** {campaign[2]}")
+        for campaign_id, name, created_at in campaigns:
+            st.write(f"- **Campaign Name:** {name}, **ID:** {campaign_id}, **Created At:** {created_at}")
     else:
         st.write("No campaigns created yet.")
 
-# GitHub workflow automation
+# GitHub workflow automation (updated to include total campaign)
 if len(sys.argv) > 1 and sys.argv[1] == "github":
-    print("🚀 Running automated fetch & store process (GitHub workflow) for default campaign")
+    print("🚀 Running automated fetch & store process (GitHub workflow) for default and total campaigns")
+    # Process default campaign
     sov_data, appearances, avg_v_rank, avg_h_rank = compute_sov("default")
     save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, "default")
     print("✅ Data stored successfully for default campaign!")
+    
+    # Process total campaign
+    compute_and_store_total_data()
+    print("✅ Total data across all campaigns stored successfully!")
