@@ -163,29 +163,27 @@ def extract_domain(url):
 
 # Save data to database with campaign_id
 def save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, campaign_id):
-    logger.info(f"Saving data for {len(sov_data)} domains to database for campaign {campaign_id}")
-    
+    logger.info(f"Attempting to save data for campaign {campaign_id}")
     if not sov_data:
-        logger.warning(f"No SoV data to save to database for campaign {campaign_id}")
+        logger.warning(f"No SoV data to save to database for campaign {campaign_id}. Check if job results were retrieved.")
         return
-        
+    
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
         today = datetime.date.today()
         logger.info(f"Saving data for date: {today} for campaign {campaign_id}")
 
         for domain in sov_data:
-            logger.info(f"Inserting data for domain: {domain}, SoV: {sov_data[domain]} for campaign {campaign_id}")
+            logger.info(f"Inserting data for domain: {domain}, SoV: {sov_data[domain]}, Appearances: {appearances[domain]}, "
+                        f"Avg V Rank: {avg_v_rank[domain]}, Avg H Rank: {avg_h_rank[domain]} for campaign {campaign_id}")
             cursor.execute("""
                 INSERT INTO share_of_voice (domain, sov, appearances, avg_v_rank, avg_h_rank, date, campaign_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (domain, round(sov_data[domain], 2), appearances[domain], 
                   avg_v_rank[domain], avg_h_rank[domain], today, campaign_id))
-
         conn.commit()
-        logger.info("Database commit successful for campaign {campaign_id}")
+        logger.info(f"Database commit successful for {len(sov_data)} domains in campaign {campaign_id}")
         cursor.close()
         conn.close()
     except Exception as e:
