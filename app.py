@@ -250,7 +250,9 @@ def create_or_update_campaign(campaign_id, campaign_name, csv_file):
     if csv_file is not None:
         csv_path = f"campaigns/{campaign_id}_jobs.csv"
         os.makedirs("campaigns", exist_ok=True)
-        csv_file.save(csv_path)
+        # Save the uploaded file to disk
+        with open(csv_path, "wb") as f:
+            f.write(csv_file.getbuffer())
     else:
         st.error("⚠️ Please upload a CSV file for the campaign!")
         return False
