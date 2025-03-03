@@ -30,7 +30,6 @@ if not DB_URL:
 def get_db_connection():
     return psycopg2.connect(DB_URL, sslmode="require")
 
-# Initialize database tables (using campaign_name as primary key)
 def initialize_database():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -59,12 +58,22 @@ def initialize_database():
         );
     """)
 
-    # Ensure campaign_name is used in share_of_voice instead of campaign_id
-    cursor.execute("ALTER TABLE share_of_voice RENAME COLUMN campaign_id TO campaign_name;")
+    # Check if campaign_id exists and rename it to campaign_name if necessary
+    cursor.execute("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns 
+            WHERE table_name = 'share_of_voice' AND column_name = 'campaign_id'
+        );
+    """)
+    if cursor.fetchone()[0]:
+        cursor.execute("ALTER TABLE share_of_voice RENAME COLUMN campaign_id TO campaign_name;")
+        logger.info("Renamed campaign_id to campaign_name in share_of_voice table")
+    else:
+        logger.info("No campaign_id column found in share_of_voice table; skipping rename")
+
     conn.commit()
     cursor.close()
     conn.close()
-
 initialize_database()
 
 # Load jobs (keywords and locations) from the database
