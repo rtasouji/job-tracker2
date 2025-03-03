@@ -9,7 +9,6 @@ import os
 import plotly.graph_objects as go
 import logging
 import sys
-logger.info(f"Current working directory: {os.getcwd()}")
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
