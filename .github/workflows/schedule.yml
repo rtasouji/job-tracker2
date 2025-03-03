@@ -30,7 +30,7 @@ jobs:
           echo "DB_URL value: $DB_URL"
           echo "SERP_API_KEY is set: ${{ secrets.SERP_API_KEY != '' }}"
 
-      - name: Get all campaign names from database
+      - name: Get all campaign IDs from database
         id: get_campaigns
         env:
           DB_URL: ${{ secrets.DB_URL }}
@@ -40,7 +40,7 @@ jobs:
           import os
           conn = psycopg2.connect(os.getenv('DB_URL'), sslmode='require')
           cursor = conn.cursor()
-          cursor.execute('SELECT campaign_name FROM campaigns')
+          cursor.execute('SELECT campaign_id FROM campaigns')
           campaigns = [row[0] for row in cursor.fetchall()]
           cursor.close()
           conn.close()
