@@ -3,12 +3,14 @@ import requests
 import pandas as pd
 import tldextract
 import psycopg2
+import json
 from collections import defaultdict
 import datetime
 import os
 import plotly.graph_objects as go
 import logging
 import sys
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +30,7 @@ if not DB_URL:
 def get_db_connection():
     return psycopg2.connect(DB_URL, sslmode="require")
 
-# Initialize database tables (including campaigns table)
+# Initialize database tables (including campaigns table with keywords)
 def initialize_database():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -43,16 +45,17 @@ def initialize_database():
             avg_v_rank FLOAT DEFAULT 0,
             avg_h_rank FLOAT DEFAULT 0,
             date DATE NOT NULL,
-            campaign_id TEXT NOT NULL  -- Add campaign_id to link data to campaigns
+            campaign_id TEXT NOT NULL
         );
     """)
 
-    # Create campaigns table to store campaign details
+    # Create campaigns table to store campaign details and keywords
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS campaigns (
             campaign_id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            csv_path TEXT NOT NULL,
+            job_titles TEXT NOT NULL,  -- JSON or string of job titles
+            locations TEXT NOT NULL,   -- JSON or string of locations
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
@@ -64,11 +67,11 @@ def initialize_database():
 
 initialize_database()
 
-# Load jobs from a specific campaign's CSV
+# Load jobs (keywords and locations) from the database
 def load_jobs(campaign_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT csv_path FROM campaigns WHERE campaign_id = %s", (campaign_id,))
+    cursor.execute("SELECT job_titles, locations FROM campaigns WHERE campaign_id = %s", (campaign_id,))
     result = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -77,13 +80,20 @@ def load_jobs(campaign_id):
         st.error(f"⚠️ Campaign '{campaign_id}' not found!")
         return []
 
-    csv_path = result[0]
-    if not os.path.exists(csv_path):
-        st.error(f"⚠️ CSV file '{csv_path}' not found for campaign '{campaign_id}'!")
+    job_titles_str, locations_str = result
+    try:
+        job_titles = json.loads(job_titles_str) if job_titles_str else []
+        locations = json.loads(locations_str) if locations_str else []
+    except json.JSONDecodeError:
+        # Fallback: assume comma-separated strings if JSON fails
+        job_titles = [t.strip() for t in job_titles_str.split(',')] if job_titles_str else []
+        locations = [l.strip() for l in locations_str.split(',')] if locations_str else []
+
+    if len(job_titles) != len(locations):
+        st.error(f"⚠️ Mismatch between job titles and locations for campaign '{campaign_id}'!")
         return []
 
-    df = pd.read_csv(csv_path)
-    return df.to_dict(orient="records")
+    return [{"job_title": title, "location": loc} for title, loc in zip(job_titles, locations)]
 
 # Fetch Google Jobs Results from SerpAPI
 def get_google_jobs_results(query, location):
@@ -120,7 +130,7 @@ def compute_sov(campaign_id):
     domain_h_rank = defaultdict(list)
 
     jobs_data = load_jobs(campaign_id)
-    logger.info(f"Loaded {len(jobs_data)} job queries from CSV for campaign {campaign_id}")
+    logger.info(f"Loaded {len(jobs_data)} job queries from database for campaign {campaign_id}")
     total_sov = 0  
 
     for job_query in jobs_data:
@@ -368,31 +378,34 @@ def compute_and_store_total_data():
     # Store total data with a special campaign_id (e.g., 'total')
     save_to_db(domain_sov, domain_appearances, total_avg_v_rank, total_avg_h_rank, "total")
 
-# Create or update a campaign
-def create_or_update_campaign(campaign_id, campaign_name, csv_file):
-    if csv_file is not None:
-        csv_path = f"campaigns/{campaign_id}_jobs.csv"
-        logger.info(f"Attempting to create directory 'campaigns' at {os.getcwd()}")
-        os.makedirs("campaigns", exist_ok=True)
-        logger.info(f"Saving CSV file to {csv_path}")
-        with open(csv_path, "wb") as f:
-            f.write(csv_file.getbuffer())
-    else:
-        st.error("⚠️ Please upload a CSV file for the campaign!")
+# Create or update a campaign (store keywords in database)
+def create_or_update_campaign(campaign_id, campaign_name, job_titles, locations):
+    if not job_titles or not locations:
+        st.error("⚠️ Please provide at least one job title and location!")
         return False
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO campaigns (campaign_id, name, csv_path)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (campaign_id) DO UPDATE 
-        SET name = EXCLUDED.name, csv_path = EXCLUDED.csv_path
-    """, (campaign_id, campaign_name, csv_path))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    logger.info(f"Campaign '{campaign_id}' created/updated successfully as '{campaign_name}' with CSV at {csv_path}")
+    try:
+        # Convert lists to JSON strings for storage
+        job_titles_json = json.dumps(job_titles)
+        locations_json = json.dumps(locations)
+        cursor.execute("""
+            INSERT INTO campaigns (campaign_id, name, job_titles, locations)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (campaign_id) DO UPDATE 
+            SET name = EXCLUDED.name, job_titles = EXCLUDED.job_titles, locations = EXCLUDED.locations
+        """, (campaign_id, campaign_name, job_titles_json, locations_json))
+        conn.commit()
+        logger.info(f"Campaign '{campaign_id}' created/updated successfully as '{campaign_name}' with {len(job_titles)} job titles and locations")
+    except Exception as e:
+        logger.error(f"Database error for campaign {campaign_id}: {str(e)}")
+        conn.rollback()
+        st.error(f"Database error: {str(e)}")
+        return False
+    finally:
+        cursor.close()
+        conn.close()
     return True
 
 # Streamlit UI
@@ -508,16 +521,29 @@ elif page == "Campaign Management":
     st.subheader("Create a New Campaign")
     campaign_id = st.text_input("Campaign ID (unique identifier)")
     campaign_name = st.text_input("Campaign Name")
-    csv_file = st.file_uploader("Upload CSV File (job_title,location)", type=["csv"])
+    
+    # Input for job titles and locations
+    st.write("Add Job Titles and Locations:")
+    job_titles = st.text_area("Job Titles (one per line)", height=100)
+    locations = st.text_area("Locations (one per line, matching job titles)", height=100)
 
     if st.button("Create/Update Campaign"):
-        if campaign_id and campaign_name and csv_file:
-            if create_or_update_campaign(campaign_id, campaign_name, csv_file):
-                st.success(f"Campaign '{campaign_id}' created/updated successfully as '{campaign_name}'!")
+        if campaign_id and campaign_name:
+            # Split input into lists, removing empty lines
+            job_titles_list = [title.strip() for title in job_titles.split('\n') if title.strip()]
+            locations_list = [loc.strip() for loc in locations.split('\n') if loc.strip()]
+            
+            if not job_titles_list or not locations_list:
+                st.error("⚠️ Please provide at least one job title and location!")
+            elif len(job_titles_list) != len(locations_list):
+                st.error("⚠️ The number of job titles must match the number of locations!")
             else:
-                st.error("Failed to create/update campaign. Please check the inputs.")
+                if create_or_update_campaign(campaign_id, campaign_name, job_titles_list, locations_list):
+                    st.success(f"Campaign '{campaign_id}' created/updated successfully as '{campaign_name}'!")
+                else:
+                    st.error("Failed to create/update campaign. Please check the inputs.")
         else:
-            st.error("Please fill in all fields and upload a CSV file.")
+            st.error("Please fill in all fields (Campaign ID and Name) and provide job titles and locations!")
 
     # List Existing Campaigns
     st.subheader("Existing Campaigns")
