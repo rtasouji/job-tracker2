@@ -466,4 +466,158 @@ if page == "Visibility Tracker":
 
     # Create a list of campaign names, including "Total" for all campaigns
     campaign_name_options = ["Total"]  # Total campaign label
-    campaign_id_map = {"Total": "tota
+    campaign_id_map = {"Total": "total"}  # Map name to ID for total
+    for campaign_id, name in campaigns:
+        campaign_name_options.append(name)
+        campaign_id_map[name] = campaign_id
+
+    # Dropdown with campaign names
+    selected_campaign_name = st.sidebar.selectbox("Select Campaign", campaign_name_options, index=0)
+    selected_campaign_id = campaign_id_map[selected_campaign_name]
+
+    # Fetch & Store Data for the selected campaign or compute total
+    if st.button("Fetch & Store Data"):
+        if selected_campaign_id == "total":
+            compute_and_store_total_data()
+            st.success("Total data across all campaigns stored successfully!")
+        else:
+            sov_data, appearances, avg_v_rank, avg_h_rank = compute_sov(selected_campaign_id)
+            save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, selected_campaign_id)
+            st.success(f"Data stored successfully for campaign '{selected_campaign_name}'!")
+
+    # Show Historical Trends for the selected campaign or total
+    st.write("### Visibility Over Time")
+    if selected_campaign_id == "total":
+        df_sov, df_metrics, df_appearances = get_total_historical_data(start_date, end_date)
+    else:
+        df_sov, df_metrics, df_appearances = get_historical_data(start_date, end_date, selected_campaign_id)
+
+    if not df_sov.empty:
+        # Share of Voice Chart
+        top_domains = df_sov.iloc[:15]
+        fig1 = go.Figure()
+        for domain in top_domains.index:
+            fig1.add_trace(go.Scatter(
+                x=top_domains.columns, 
+                y=top_domains.loc[domain], 
+                mode="markers+lines", 
+                name=domain
+            ))
+        fig1.update_layout(
+            title=f"Domains Visibility Over Time for {selected_campaign_name}",
+            xaxis_title="Date",
+            yaxis_title="Share of Voice (%)",
+            updatemenus=[{"buttons": [{"args": [{"visible": True}], "label": "Show All", "method": "update"},
+                                     {"args": [{"visible": "legendonly"}], "label": "Hide All", "method": "update"}],
+                          "direction": "right", "showactive": True, "x": 1, "xanchor": "right", "y": 1.15, "yanchor": "top"}]
+        )
+        st.plotly_chart(fig1)
+        st.write("#### Table of Visibility Score Data")
+        st.dataframe(df_sov.style.format("{:.2f}"))
+
+        # Appearances Chart
+        st.write("### Appearances Over Time")
+        top_domains_appearances = df_appearances.loc[top_domains.index]
+        fig2 = go.Figure()
+        for domain in top_domains_appearances.index:
+            fig2.add_trace(go.Scatter(
+                x=top_domains_appearances.columns,
+                y=top_domains_appearances.loc[domain],
+                mode="markers+lines",
+                name=domain
+            ))
+        fig2.update_layout(
+            title=f"Domain Appearances Over Time for {selected_campaign_name}",
+            xaxis_title="Date",
+            yaxis_title="Number of Appearances",
+            updatemenus=[{"buttons": [{"args": [{"visible": True}], "label": "Show All", "method": "update"},
+                                     {"args": [{"visible": "legendonly"}], "label": "Hide All", "method": "update"}],
+                          "direction": "right", "showactive": True, "x": 1, "xanchor": "right", "y": 1.15, "yanchor": "top"}]
+        )
+        st.plotly_chart(fig2)
+        st.write("### Additional Metrics Over Time")
+        st.dataframe(df_metrics.style.format("{:.2f}"))
+    else:
+        st.write(f"No historical data available for the selected date range and {selected_campaign_name}")
+
+elif page == "Campaign Management":
+    st.header("Campaign Management")
+
+    # Create New Campaign
+    st.subheader("Create a New Campaign")
+    campaign_id = st.text_input("Campaign ID (unique identifier)")
+    campaign_name = st.text_input("Campaign Name")
+    
+    # Input for job titles and locations
+    st.write("Add Job Titles and Locations:")
+    job_titles = st.text_area("Job Titles (one per line)", height=100)
+    locations = st.text_area("Locations (one per line, matching job titles)", height=100)
+
+    if st.button("Create/Update Campaign"):
+        if campaign_id and campaign_name:
+            # Split input into lists, removing empty lines
+            job_titles_list = [title.strip() for title in job_titles.split('\n') if title.strip()]
+            locations_list = [loc.strip() for loc in locations.split('\n') if loc.strip()]
+            
+            if not job_titles_list or not locations_list:
+                st.error("⚠️ Please provide at least one job title and location!")
+            elif len(job_titles_list) != len(locations_list):
+                st.error("⚠️ The number of job titles must match the number of locations!")
+            else:
+                if create_or_update_campaign(campaign_id, campaign_name, job_titles_list, locations_list):
+                    st.success(f"Campaign '{campaign_id}' created/updated successfully as '{campaign_name}'!")
+                else:
+                    st.error("Failed to create/update campaign. Please check the inputs.")
+        else:
+            st.error("Please fill in all fields (Campaign ID and Name) and provide job titles and locations!")
+
+    # Delete Campaign
+    st.subheader("Delete a Campaign")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT campaign_id, name FROM campaigns")
+    campaigns = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    if campaigns:
+        st.write("### Select Campaign to Delete")
+        campaign_options = [f"{name} (ID: {cid})" for cid, name in campaigns]
+        selected_campaign_option = st.selectbox("Choose a campaign to delete", [""] + campaign_options)
+        
+        if selected_campaign_option:
+            campaign_name = selected_campaign_option.split(" (ID: ")[0]
+            campaign_id = selected_campaign_option.split(" (ID: ")[1].rstrip(")")
+            if st.button(f"Delete {campaign_name} (ID: {campaign_id})"):
+                delete_campaign(campaign_id)
+                st.experimental_rerun()  # Refresh the page to reflect the deletion
+    else:
+        st.write("No campaigns available to delete.")
+
+    # List Existing Campaigns
+    st.subheader("Existing Campaigns")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT campaign_id, name, created_at FROM campaigns ORDER BY created_at DESC")
+    campaigns = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    if campaigns:
+        st.write("### Campaign List")
+        for campaign_id, name, created_at in campaigns:
+            st.write(f"- **Campaign Name:** {name}, **ID:** {campaign_id}, **Created At:** {created_at}")
+    else:
+        st.write("No campaigns created yet.")
+
+# GitHub workflow automation (updated to include total campaign)
+if len(sys.argv) > 1 and sys.argv[1] == "github":
+    print("🚀 Running automated fetch & store process (GitHub workflow) for default and total campaigns")
+    # Process default campaign
+    sov_data, appearances, avg_v_rank, avg_h_rank = compute_sov("default")
+    save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, "default")
+    print("✅ Data stored successfully for default campaign!")
+    
+    # Process total campaign
+    compute_and_store_total_data()
+    print("✅ Total data across all campaigns stored successfully!")
