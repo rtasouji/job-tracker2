@@ -30,12 +30,12 @@ if not DB_URL:
 def get_db_connection():
     return psycopg2.connect(DB_URL, sslmode="require")
 
-# Initialize database tables (using campaign_name as primary key, without ALTER TABLE)
+# Initialize database tables (including campaigns table with keywords)
 def initialize_database():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Create or update share_of_voice table (using campaign_name)
+    # Create or update share_of_voice table (existing)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS share_of_voice (
             id SERIAL PRIMARY KEY,
@@ -45,23 +45,22 @@ def initialize_database():
             avg_v_rank FLOAT DEFAULT 0,
             avg_h_rank FLOAT DEFAULT 0,
             date DATE NOT NULL,
-            campaign_name TEXT NOT NULL
+            campaign_id TEXT NOT NULL  -- Add campaign_id to link data to campaigns
         );
     """)
 
-    # Create campaigns table to store campaign details and keywords with campaign_name as primary key
+    # Create campaigns table to store campaign details and keywords
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS campaigns (
-            campaign_name TEXT PRIMARY KEY,
+            campaign_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
             job_titles TEXT NOT NULL,  -- JSON or string of job titles
             locations TEXT NOT NULL,   -- JSON or string of locations
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
 
-    # No need to check for or rename campaign_id, as we expect campaign_name now
-    logger.info("Database tables initialized with campaign_name as primary key")
-
+    cursor.execute("ALTER TABLE share_of_voice ADD COLUMN IF NOT EXISTS campaign_id TEXT NOT NULL DEFAULT 'default';")
     conn.commit()
     cursor.close()
     conn.close()
@@ -69,16 +68,16 @@ def initialize_database():
 initialize_database()
 
 # Load jobs (keywords and locations) from the database
-def load_jobs(campaign_name):
+def load_jobs(campaign_id):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT job_titles, locations FROM campaigns WHERE campaign_name = %s", (campaign_name,))
+    cursor.execute("SELECT job_titles, locations FROM campaigns WHERE campaign_id = %s", (campaign_id,))
     result = cursor.fetchone()
     cursor.close()
     conn.close()
 
     if not result:
-        st.error(f"⚠️ Campaign '{campaign_name}' not found!")
+        st.error(f"⚠️ Campaign '{campaign_id}' not found!")
         return []
 
     job_titles_str, locations_str = result
@@ -91,7 +90,7 @@ def load_jobs(campaign_name):
         locations = [l.strip() for l in locations_str.split(',')] if locations_str else []
 
     if len(job_titles) != len(locations):
-        st.error(f"⚠️ Mismatch between job titles and locations for campaign '{campaign_name}'!")
+        st.error(f"⚠️ Mismatch between job titles and locations for campaign '{campaign_id}'!")
         return []
 
     return [{"job_title": title, "location": loc} for title, loc in zip(job_titles, locations)]
@@ -123,27 +122,27 @@ def get_google_jobs_results(query, location):
     return results
 
 # Compute Share of Voice & Additional Metrics for a specific campaign
-def compute_sov(campaign_name):
-    logger.info(f"Starting compute_sov for campaign {campaign_name}")
+def compute_sov(campaign_id):
+    logger.info(f"Starting compute_sov for campaign {campaign_id}")
     domain_sov = defaultdict(float)
     domain_appearances = defaultdict(int)
     domain_v_rank = defaultdict(list)
     domain_h_rank = defaultdict(list)
 
-    jobs_data = load_jobs(campaign_name)
-    logger.info(f"Loaded {len(jobs_data)} job queries from database for campaign {campaign_name}")
+    jobs_data = load_jobs(campaign_id)
+    logger.info(f"Loaded {len(jobs_data)} job queries from database for campaign {campaign_id}")
     total_sov = 0  
 
     for job_query in jobs_data:
         job_title = job_query["job_title"]
         location = job_query["location"]
-        logger.info(f"Processing job query: {job_title} in {location} for campaign {campaign_name}")
+        logger.info(f"Processing job query: {job_title} in {location} for campaign {campaign_id}")
 
         try:
             jobs = get_google_jobs_results(job_title, location)
-            logger.info(f"Retrieved {len(jobs)} job results for query in campaign {campaign_name}")
+            logger.info(f"Retrieved {len(jobs)} job results for query in campaign {campaign_id}")
             if not jobs:
-                logger.warning(f"No jobs found for query: {job_title} in {location} for campaign {campaign_name}")
+                logger.warning(f"No jobs found for query: {job_title} in {location} for campaign {campaign_id}")
             
             for job_rank, job in enumerate(jobs, start=1):
                 apply_options = job.get("apply_options", [])
@@ -162,19 +161,19 @@ def compute_sov(campaign_name):
                         domain_h_rank[domain].append(link_order)
                         total_sov += weight  
         except Exception as e:
-            logger.error(f"Error processing job query {job_title} for campaign {campaign_name}: {str(e)}")
+            logger.error(f"Error processing job query {job_title} for campaign {campaign_id}: {str(e)}")
             continue
 
     if total_sov > 0:
-        logger.info(f"Computed SoV for {len(domain_sov)} domains with total SoV: {total_sov} for campaign {campaign_name}")
+        logger.info(f"Computed SoV for {len(domain_sov)} domains with total SoV: {total_sov} for campaign {campaign_id}")
         domain_sov = {domain: round((sov / total_sov) * 100, 4) for domain, sov in domain_sov.items()}
     else:
-        logger.warning(f"No SoV computed for campaign {campaign_name} due to zero total SoV")
+        logger.warning(f"No SoV computed for campaign {campaign_id} due to zero total SoV")
     
     domain_avg_v_rank = {domain: round(sum(vr) / len(vr), 2) for domain, vr in domain_v_rank.items() if vr}
     domain_avg_h_rank = {domain: round(sum(hr) / len(hr), 2) for domain, hr in domain_h_rank.items() if hr}
 
-    logger.info(f"Returning SoV data for {len(domain_sov)} domains for campaign {campaign_name}")
+    logger.info(f"Returning SoV data for {len(domain_sov)} domains for campaign {campaign_id}")
     return domain_sov, domain_appearances, domain_avg_v_rank, domain_avg_h_rank
 
 # Extract Domain from URL
@@ -183,38 +182,38 @@ def extract_domain(url):
     domain = f"{extracted.domain}.{extracted.suffix}" if extracted.suffix else extracted.domain
     return domain.lower().replace("www.", "")
 
-# Save data to database with campaign_name
-def save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, campaign_name):
-    logger.info(f"Attempting to save data for campaign {campaign_name}")
+# Save data to database with campaign_id
+def save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, campaign_id):
+    logger.info(f"Attempting to save data for campaign {campaign_id}")
     if not sov_data:
-        logger.warning(f"No SoV data to save to database for campaign {campaign_name}. Check if job results were retrieved.")
+        logger.warning(f"No SoV data to save to database for campaign {campaign_id}. Check if job results were retrieved.")
         return
     
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         today = datetime.date.today()
-        logger.info(f"Saving data for date: {today} for campaign {campaign_name}")
+        logger.info(f"Saving data for date: {today} for campaign {campaign_id}")
 
         for domain in sov_data:
             logger.info(f"Inserting data for domain: {domain}, SoV: {sov_data[domain]}, Appearances: {appearances[domain]}, "
-                        f"Avg V Rank: {avg_v_rank[domain]}, Avg H Rank: {avg_h_rank[domain]} for campaign {campaign_name}")
+                        f"Avg V Rank: {avg_v_rank[domain]}, Avg H Rank: {avg_h_rank[domain]} for campaign {campaign_id}")
             cursor.execute("""
-                INSERT INTO share_of_voice (domain, sov, appearances, avg_v_rank, avg_h_rank, date, campaign_name)
+                INSERT INTO share_of_voice (domain, sov, appearances, avg_v_rank, avg_h_rank, date, campaign_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (domain, round(sov_data[domain], 2), appearances[domain], 
-                  avg_v_rank[domain], avg_h_rank[domain], today, campaign_name))
+                  avg_v_rank[domain], avg_h_rank[domain], today, campaign_id))
         conn.commit()
-        logger.info(f"Database commit successful for {len(sov_data)} domains in campaign {campaign_name}")
+        logger.info(f"Database commit successful for {len(sov_data)} domains in campaign {campaign_id}")
         cursor.close()
         conn.close()
     except Exception as e:
-        logger.error(f"Database error for campaign {campaign_name}: {str(e)}")
+        logger.error(f"Database error for campaign {campaign_id}: {str(e)}")
         raise
 
 # Retrieve historical data for a specific campaign
-def get_historical_data(start_date, end_date, campaign_name):
-    logger.info(f"Retrieving historical data for campaign {campaign_name} from {start_date} to {end_date}")
+def get_historical_data(start_date, end_date, campaign_id):
+    logger.info(f"Retrieving historical data for campaign {campaign_id} from {start_date} to {end_date}")
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -237,12 +236,12 @@ def get_historical_data(start_date, end_date, campaign_name):
     query = """
         SELECT domain, date, sov, appearances, avg_v_rank, avg_h_rank
         FROM share_of_voice 
-        WHERE date BETWEEN %s AND %s AND campaign_name = %s
+        WHERE date BETWEEN %s AND %s AND campaign_id = %s
     """
-    logger.info(f"Executing query for campaign {campaign_name} with date range {start_date} to {end_date}")
-    cursor.execute(query, (start_date, end_date, campaign_name))
+    logger.info(f"Executing query for campaign {campaign_id} with date range {start_date} to {end_date}")
+    cursor.execute(query, (start_date, end_date, campaign_id))
     rows = cursor.fetchall()
-    logger.info(f"Found {len(rows)} rows for campaign {campaign_name}")
+    logger.info(f"Found {len(rows)} rows for campaign {campaign_id}")
 
     df = pd.DataFrame(rows, columns=["domain", "date", "sov", "appearances", "avg_v_rank", "avg_h_rank"])
 
@@ -250,7 +249,7 @@ def get_historical_data(start_date, end_date, campaign_name):
     conn.close()
 
     if df.empty:
-        logger.warning(f"No data available for campaign {campaign_name} in the selected date range.")
+        logger.warning(f"No data available for campaign {campaign_id} in the selected date range.")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     df["date"] = pd.to_datetime(df["date"]).dt.date  
@@ -271,7 +270,7 @@ def get_historical_data(start_date, end_date, campaign_name):
 
     df_appearances = df_agg.pivot(index="domain", columns="date", values="appearances").fillna(0)
 
-    logger.info(f"Returning data for {len(df_sov)} domains for campaign {campaign_name}")
+    logger.info(f"Returning data for {len(df_sov)} domains for campaign {campaign_id}")
     return df_sov, df_metrics, df_appearances
 
 # New function to get total data across all campaigns
@@ -336,14 +335,14 @@ def get_total_historical_data(start_date, end_date):
     logger.info(f"Returning total data for {len(df_sov)} domains")
     return df_sov, df_metrics, df_appearances
 
-# New function to fetch and store total data (with fixed dictionary comprehension)
+# New function to fetch and store total data
 def compute_and_store_total_data():
     logger.info("Computing and storing total data across all campaigns")
     conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT domain, date, sov, appearances, avg_v_rank, avg_h_rank, campaign_name
+        SELECT domain, date, sov, appearances, avg_v_rank, avg_h_rank, campaign_id
         FROM share_of_voice
     """)
     rows = cursor.fetchall()
@@ -367,22 +366,22 @@ def compute_and_store_total_data():
         domain_v_rank[domain].append(avg_v_rank)
         domain_h_rank[domain].append(avg_h_rank)
 
-    # Calculate averages for ranks (corrected conditions)
+    # Calculate averages for ranks
     total_avg_v_rank = {domain: round(sum(ranks) / len(ranks), 2) for domain, ranks in domain_v_rank.items() if ranks}
-    total_avg_h_rank = {domain: round(sum(ranks) / len(ranks), 2) for domain, ranks in domain_h_rank.items() if ranks}
+    total_avg_h_rank = {domain: round(sum(ranks) / len(ranks), 2) for domain, ranks in domain_h_rank.items() if hr}
 
     # Normalize SoV to 100% total (optional, depending on your needs)
     total_sov = sum(domain_sov.values())
     if total_sov > 0:
         domain_sov = {domain: round((sov / total_sov) * 100, 4) for domain, sov in domain_sov.items()}
 
-    # Store total data with a special campaign_name (e.g., 'Total')
-    save_to_db(domain_sov, domain_appearances, total_avg_v_rank, total_avg_h_rank, "Total")
+    # Store total data with a special campaign_id (e.g., 'total')
+    save_to_db(domain_sov, domain_appearances, total_avg_v_rank, total_avg_h_rank, "total")
 
-# Create or update a campaign (store keywords in database using campaign_name)
-def create_or_update_campaign(campaign_name, job_titles, locations):
-    if not campaign_name or not job_titles or not locations:
-        st.error("⚠️ Please provide a campaign name and at least one job title and location!")
+# Create or update a campaign (store keywords in database)
+def create_or_update_campaign(campaign_id, campaign_name, job_titles, locations):
+    if not campaign_id or not job_titles or not locations:
+        st.error("⚠️ Please provide a campaign ID and at least one job title and location!")
         return False
 
     conn = get_db_connection()
@@ -392,15 +391,15 @@ def create_or_update_campaign(campaign_name, job_titles, locations):
         job_titles_json = json.dumps(job_titles)
         locations_json = json.dumps(locations)
         cursor.execute("""
-            INSERT INTO campaigns (campaign_name, job_titles, locations)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (campaign_name) DO UPDATE 
-            SET job_titles = EXCLUDED.job_titles, locations = EXCLUDED.locations
-        """, (campaign_name, job_titles_json, locations_json))
+            INSERT INTO campaigns (campaign_id, name, job_titles, locations)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (campaign_id) DO UPDATE 
+            SET name = EXCLUDED.name, job_titles = EXCLUDED.job_titles, locations = EXCLUDED.locations
+        """, (campaign_id, campaign_name, job_titles_json, locations_json))
         conn.commit()
-        logger.info(f"Campaign '{campaign_name}' created/updated successfully with {len(job_titles)} job titles and locations")
+        logger.info(f"Campaign '{campaign_id}' created/updated successfully as '{campaign_name}' with {len(job_titles)} job titles and locations")
     except Exception as e:
-        logger.error(f"Database error for campaign {campaign_name}: {str(e)}")
+        logger.error(f"Database error for campaign {campaign_id}: {str(e)}")
         conn.rollback()
         st.error(f"Database error: {str(e)}")
         return False
@@ -410,25 +409,25 @@ def create_or_update_campaign(campaign_name, job_titles, locations):
     return True
 
 # Delete a campaign and optionally its associated data
-def delete_campaign(campaign_name):
+def delete_campaign(campaign_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         # Delete associated data from share_of_voice (optional, can be skipped for historical tracking)
-        cursor.execute("DELETE FROM share_of_voice WHERE campaign_name = %s", (campaign_name,))
-        logger.info(f"Deleted {cursor.rowcount} records from share_of_voice for campaign {campaign_name}")
+        cursor.execute("DELETE FROM share_of_voice WHERE campaign_id = %s", (campaign_id,))
+        logger.info(f"Deleted {cursor.rowcount} records from share_of_voice for campaign {campaign_id}")
 
         # Delete the campaign from campaigns table
-        cursor.execute("DELETE FROM campaigns WHERE campaign_name = %s", (campaign_name,))
+        cursor.execute("DELETE FROM campaigns WHERE campaign_id = %s", (campaign_id,))
         if cursor.rowcount > 0:
             conn.commit()
-            logger.info(f"Campaign '{campaign_name}' deleted successfully")
-            st.success(f"Campaign '{campaign_name}' deleted successfully!")
+            logger.info(f"Campaign '{campaign_id}' deleted successfully")
+            st.success(f"Campaign '{campaign_id}' deleted successfully!")
         else:
-            logger.warning(f"No campaign found with name '{campaign_name}'")
-            st.warning(f"No campaign found with name '{campaign_name}'")
+            logger.warning(f"No campaign found with ID '{campaign_id}'")
+            st.warning(f"No campaign found with ID '{campaign_id}'")
     except Exception as e:
-        logger.error(f"Error deleting campaign {campaign_name}: {str(e)}")
+        logger.error(f"Error deleting campaign {campaign_id}: {str(e)}")
         conn.rollback()
         st.error(f"Error deleting campaign: {str(e)}")
     finally:
@@ -460,35 +459,38 @@ if page == "Visibility Tracker":
     # Campaign selector for visibility tracker (using campaign names)
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT campaign_name FROM campaigns")
-    campaign_names = [row[0] for row in cursor.fetchall()]
+    cursor.execute("SELECT campaign_id, name FROM campaigns")
+    campaigns = cursor.fetchall()
     cursor.close()
     conn.close()
 
     # Create a list of campaign names, including "Total" for all campaigns
     campaign_name_options = ["Total"]  # Total campaign label
-    for name in campaign_names:
+    campaign_id_map = {"Total": "total"}  # Map name to ID for total
+    for campaign_id, name in campaigns:
         campaign_name_options.append(name)
+        campaign_id_map[name] = campaign_id
 
     # Dropdown with campaign names
     selected_campaign_name = st.sidebar.selectbox("Select Campaign", campaign_name_options, index=0)
+    selected_campaign_id = campaign_id_map[selected_campaign_name]
 
     # Fetch & Store Data for the selected campaign or compute total
     if st.button("Fetch & Store Data"):
-        if selected_campaign_name == "Total":
+        if selected_campaign_id == "total":
             compute_and_store_total_data()
             st.success("Total data across all campaigns stored successfully!")
         else:
-            sov_data, appearances, avg_v_rank, avg_h_rank = compute_sov(selected_campaign_name)
-            save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, selected_campaign_name)
+            sov_data, appearances, avg_v_rank, avg_h_rank = compute_sov(selected_campaign_id)
+            save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, selected_campaign_id)
             st.success(f"Data stored successfully for campaign '{selected_campaign_name}'!")
 
     # Show Historical Trends for the selected campaign or total
     st.write("### Visibility Over Time")
-    if selected_campaign_name == "Total":
+    if selected_campaign_id == "total":
         df_sov, df_metrics, df_appearances = get_total_historical_data(start_date, end_date)
     else:
-        df_sov, df_metrics, df_appearances = get_historical_data(start_date, end_date, selected_campaign_name)
+        df_sov, df_metrics, df_appearances = get_historical_data(start_date, end_date, selected_campaign_id)
 
     if not df_sov.empty:
         # Share of Voice Chart
@@ -543,7 +545,8 @@ elif page == "Campaign Management":
 
     # Create New Campaign
     st.subheader("Create a New Campaign")
-    campaign_name = st.text_input("Campaign Name (unique identifier)")
+    campaign_id = st.text_input("Campaign ID (unique identifier)")
+    campaign_name = st.text_input("Campaign Name")
     
     # Input for job titles and locations
     st.write("Add Job Titles and Locations:")
@@ -551,7 +554,7 @@ elif page == "Campaign Management":
     locations = st.text_area("Locations (one per line, matching job titles)", height=100)
 
     if st.button("Create/Update Campaign"):
-        if campaign_name:
+        if campaign_id and campaign_name:
             # Split input into lists, removing empty lines
             job_titles_list = [title.strip() for title in job_titles.split('\n') if title.strip()]
             locations_list = [loc.strip() for loc in locations.split('\n') if loc.strip()]
@@ -561,29 +564,32 @@ elif page == "Campaign Management":
             elif len(job_titles_list) != len(locations_list):
                 st.error("⚠️ The number of job titles must match the number of locations!")
             else:
-                if create_or_update_campaign(campaign_name, job_titles_list, locations_list):
-                    st.success(f"Campaign '{campaign_name}' created/updated successfully!")
+                if create_or_update_campaign(campaign_id, campaign_name, job_titles_list, locations_list):
+                    st.success(f"Campaign '{campaign_id}' created/updated successfully as '{campaign_name}'!")
                 else:
                     st.error("Failed to create/update campaign. Please check the inputs.")
         else:
-            st.error("Please provide a campaign name and job titles and locations!")
+            st.error("Please fill in all fields (Campaign ID and Name) and provide job titles and locations!")
 
     # Delete Campaign
     st.subheader("Delete a Campaign")
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT campaign_name FROM campaigns")
-    campaign_names = [row[0] for row in cursor.fetchall()]
+    cursor.execute("SELECT campaign_id, name FROM campaigns")
+    campaigns = cursor.fetchall()
     cursor.close()
     conn.close()
 
-    if campaign_names:
+    if campaigns:
         st.write("### Select Campaign to Delete")
-        selected_campaign_name = st.selectbox("Choose a campaign to delete", [""] + campaign_names)
+        campaign_options = [f"{name} (ID: {cid})" for cid, name in campaigns]
+        selected_campaign_option = st.selectbox("Choose a campaign to delete", [""] + campaign_options)
         
-        if selected_campaign_name:
-            if st.button(f"Delete {selected_campaign_name}"):
-                delete_campaign(selected_campaign_name)
+        if selected_campaign_option:
+            campaign_name = selected_campaign_option.split(" (ID: ")[0]
+            campaign_id = selected_campaign_option.split(" (ID: ")[1].rstrip(")")
+            if st.button(f"Delete {campaign_name} (ID: {campaign_id})"):
+                delete_campaign(campaign_id)
                 st.experimental_rerun()  # Refresh the page to reflect the deletion
     else:
         st.write("No campaigns available to delete.")
@@ -592,24 +598,24 @@ elif page == "Campaign Management":
     st.subheader("Existing Campaigns")
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT campaign_name, created_at FROM campaigns ORDER BY created_at DESC")
+    cursor.execute("SELECT campaign_id, name, created_at FROM campaigns ORDER BY created_at DESC")
     campaigns = cursor.fetchall()
     cursor.close()
     conn.close()
 
     if campaigns:
         st.write("### Campaign List")
-        for campaign_name, created_at in campaigns:
-            st.write(f"- **Campaign Name:** {campaign_name}, **Created At:** {created_at}")
+        for campaign_id, name, created_at in campaigns:
+            st.write(f"- **Campaign Name:** {name}, **ID:** {campaign_id}, **Created At:** {created_at}")
     else:
         st.write("No campaigns created yet.")
 
-# GitHub workflow automation (updated to use campaign names)
+# GitHub workflow automation (updated to include total campaign)
 if len(sys.argv) > 1 and sys.argv[1] == "github":
     print("🚀 Running automated fetch & store process (GitHub workflow) for default and total campaigns")
-    # Process default campaign (using 'Default' as the name)
-    sov_data, appearances, avg_v_rank, avg_h_rank = compute_sov("Default")
-    save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, "Default")
+    # Process default campaign
+    sov_data, appearances, avg_v_rank, avg_h_rank = compute_sov("default")
+    save_to_db(sov_data, appearances, avg_v_rank, avg_h_rank, "default")
     print("✅ Data stored successfully for default campaign!")
     
     # Process total campaign
